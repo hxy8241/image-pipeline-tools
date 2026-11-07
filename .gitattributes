@@ -1,0 +1,4 @@
+# 统一换行：仓库内用 LF，检出到 Windows 时 .ps1 用 CRLF
+* text=auto
+*.py text eol=lf
+*.ps1 text eol=crlf
