@@ -27,6 +27,9 @@
     高压缩率格式按静态图原样搬运, 其余格式视为破损
   - JXL 用 jxlinfo 读尺寸、用 djxl 解码(仅校验文件头); 大 JXL 同样会缩放
   - 目标目录若在源目录内, 扫描时会自动跳过它, 重复运行安全
+  - 源目录里的符号链接/目录联接(junction)一律跳过, 不处理其内容
+    (rglob 会跟进联接, 指向父目录会无限深入, 指向树外会误删树外文件)
+  - 上次被强杀留下的 __pipeline_tmp_* 目录会在启动扫描时自动清理(超过 24 小时)
   - 空目录不还原
 """
 
@@ -99,6 +102,7 @@ BYTES_PER_MB = 1024 * 1024
 TIMEOUT_CAP = 21600          # 7z 超时上限 6 小时
 _TOOL_TIMEOUT = 600          # cjxl 单次调用超时
 _7Z_BASE_TIMEOUT = 600
+MAX_NESTED_DEPTH = 3         # tar.gz 这类双层包最多再展开几层
 
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
@@ -625,7 +629,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
         images, others, broken = classify_extracted(tmp)
 
         # 双层包: 外层一张静态图都没有时才继续展开内层, 避免拆开包里附带的 zip
-        for _depth in range(3):
+        for _depth in range(MAX_NESTED_DEPTH):
             if images:
                 break
             inner = [(p, rel) for p, rel in others
@@ -690,32 +694,79 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
 
 # ── 主流程 ──────────────────────────────────────────────────────────────
 
-def _is_under(path: Path, root: Path) -> bool:
+def _is_link_or_junction(path: Path) -> bool:
+    """符号链接或 Windows 目录联接(junction)/挂载点。
+
+    Path.rglob 会跟进 junction(符号链接则不会): 指向父目录的联接会让扫描无限
+    深入同一个目录, 指向树外的联接会让脚本把树外的图片搬走并删除 —— 必须剪枝。
+    """
     try:
-        path.relative_to(root)
-        return True
-    except ValueError:
+        if path.is_symlink():
+            return True
+        if os.name == "nt":
+            attrs = os.lstat(path).st_file_attributes
+            return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
         return False
+    return False
+
+
+def _drop_stale_temp(path: Path, max_age: float = 24 * 3600) -> None:
+    """清理上次被强杀留下的临时目录; 正在运行的实例目录很新, 不会被误删。"""
+    try:
+        if time.time() - path.stat().st_mtime > max_age:
+            shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def collect_files(source_root: Path, target_root: Path):
-    """递归收集待处理的图片与压缩包; 跳过目标目录(若在源目录内)和临时目录。"""
+    """递归收集待处理的图片与压缩包。
+
+    用 os.walk 而不是 rglob: 必须在进入目录前剪掉链接/联接, rglob 做不到
+    (实测 junction 会被反复跟进, 路径层层变长)。同时跳过目标目录(若在源目录内)
+    和本脚本的临时目录, 顺手清掉过期的临时目录。
+    """
     images, archives = [], []
-    for p in source_root.rglob("*"):
-        try:
-            if not p.is_file():
+    target_abs = os.path.normcase(os.path.abspath(target_root))
+    skipped_links = []
+
+    for dirpath, dirnames, filenames in os.walk(source_root, topdown=True):
+        keep = []
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            if name.startswith(STAGING_PREFIX):
+                _drop_stale_temp(Path(full))
                 continue
-        except OSError:
-            continue
-        if any(part.startswith(STAGING_PREFIX) for part in p.parts):
-            continue
-        if target_root != source_root and _is_under(p, target_root):
-            continue
-        ext = p.suffix.lower()
-        if ext in ARCHIVE_EXTS:
-            archives.append(p)
-        elif ext in IMAGE_EXTS:
-            images.append(p)
+            if _is_link_or_junction(Path(full)):
+                skipped_links.append(full)
+                continue
+            if os.path.normcase(os.path.abspath(full)) == target_abs:
+                continue
+            keep.append(name)
+        dirnames[:] = keep
+
+        for name in filenames:
+            p = Path(dirpath) / name
+            ext = p.suffix.lower()
+            if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
+                continue
+            if _is_link_or_junction(p):
+                skipped_links.append(str(p))
+                continue
+            if ext in ARCHIVE_EXTS:
+                archives.append(p)
+            else:
+                images.append(p)
+
+    if skipped_links:
+        print(f"提示: 跳过 {len(skipped_links)} 个链接/联接(不处理其内容):",
+              file=sys.stderr)
+        for s in skipped_links[:5]:
+            print(f"  · {s}", file=sys.stderr)
+        if len(skipped_links) > 5:
+            print(f"  ... 另有 {len(skipped_links) - 5} 个", file=sys.stderr)
+
     images.sort()
     archives.sort(key=lambda p: (len(p.relative_to(source_root).parts), str(p)))
     return images, archives
