@@ -804,6 +804,9 @@ def main(argv=None) -> int:
         return 2
 
     sw, sh = screen_resolution()
+    # 整个运行期间(含扫描)阻止系统空闲睡眠, 正常结束或 Ctrl+C 时在 finally 里恢复。
+    # 该状态是线程级的: 万一进程先退出, 线程结束时系统也会自动清除。
+    prevent_sleep()
     images, archives = collect_files(source_root, dest_root)
 
     if not images and not archives:
@@ -830,7 +833,6 @@ def main(argv=None) -> int:
     kept = []
     errors = []
 
-    prevent_sleep()
     try:
         # ---- 1. 目录里的散图 ----
         for idx, path in enumerate(images, 1):
