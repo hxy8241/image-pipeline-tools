@@ -34,6 +34,7 @@
 """
 
 import argparse
+import atexit
 import ctypes
 import errno
 import os
@@ -284,7 +285,8 @@ def move_to(src: Path, target_root: Path, rel: Path) -> Path:
     except BaseException:
         part.unlink(missing_ok=True)
         raise
-    src.unlink()
+    if not unlink_robust(src):
+        raise RuntimeError(f"跨卷搬运完成但源文件删除失败(目标已生成): {src}")
     return dest
 
 
@@ -298,6 +300,19 @@ def make_temp_dir(parent: Path) -> Path:
         except FileExistsError:
             continue
     raise OSError(f"无法在 {parent} 下创建临时目录")
+
+
+def _discard_created(paths) -> None:
+    """回滚某个压缩包本次产出的文件。
+
+    压缩包保留时这些产物在包里仍有原件; 留着只会在重跑时变成 _1、_2 副本,
+    所以失败即清掉, 让重跑从干净状态开始。清理失败只影响整洁, 不影响数据。
+    """
+    for p in paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def unlink_robust(path: Path, attempts: int = 5, delay: float = 0.3) -> bool:
@@ -363,9 +378,10 @@ def probe_image(path: Path, validate: bool = True):
                 im.load()
     except Image.UnidentifiedImageError as e:
         if ext == ".jxl":
-            size = probe_jxl_size(path)
-            if size:
-                return "static", size[0], size[1], ""
+            info = probe_jxl_info(path)
+            if info:
+                jw, jh, animated = info
+                return ("animated" if animated else "static"), jw, jh, ""
         return "unverified", 0, 0, f"Pillow 无法识别: {e}"
     except MemoryError:
         return "broken", 0, 0, "解码时内存不足"
@@ -376,8 +392,12 @@ def probe_image(path: Path, validate: bool = True):
     return ("animated" if frames > 1 else "static"), w, h, ""
 
 
-def probe_jxl_size(path: Path):
-    """用 jxlinfo -v 读 JXL 尺寸与方向(只解析头, 不解码像素)。失败返回 None。"""
+def probe_jxl_info(path: Path):
+    """用 jxlinfo -v 读 JXL 的尺寸/方向/是否动画(只解析头, 不解码像素)。失败返回 None。
+
+    返回 (w, h, animated)。JXL 支持动画, 必须看 "Have animation" 字段,
+    否则动画 JXL 会被当成静态图缩放, 动态内容静默丢失。
+    """
     if not _HAS_JXLINFO:
         return None
     try:
@@ -395,7 +415,8 @@ def probe_jxl_size(path: Path):
     o = re.search(r"Orientation:\s*(\d+)", out)
     if o and int(o.group(1)) in (5, 6, 7, 8):
         w, h = h, w
-    return w, h
+    animated = bool(re.search(r"Have animation:\s*1", out))
+    return w, h, animated
 
 
 def _djxl_to_png(src: Path, dst_png: Path) -> None:
@@ -498,31 +519,48 @@ def make_resized_png(src: Path, dst_png: Path, nw: int, nh: int) -> None:
     _pillow_resize(src, dst_png, nw, nh)
 
 
+def _cjxl_run(src: Path, out: Path, extra=()) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["cjxl", str(src), str(out), *extra],
+                              capture_output=True, timeout=_TOOL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"cjxl 编码超时({_TOOL_TIMEOUT} 秒)")
+
+
+def _cjxl_error(proc) -> str:
+    return proc.stderr.decode("utf-8", "replace").strip()[:160]
+
+
 def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
     """把 src 编码成 dest(.jxl)。给了 nw/nh 时先解码缩放成 PNG 再编码。
 
-    整个中间过程都在 dest 所在目录的临时目录里完成, 保证最后一步是原子替换。
+    JPEG 优先让 cjxl 无损重编码; cjxl 不认的 JPEG(CMYK、异常尾部数据)逐级降级:
+    无损重编码 -> 按像素无损编码(--lossless_jpeg=0) -> Pillow 解码成 PNG 再编码。
+    整个中间过程都在 dest 所在目录的临时目录里完成, 最后一步是原子替换。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     work = make_temp_dir(dest.parent)
     try:
+        out = work / "out.jxl"
         if nw is None and src.suffix.lower() in JPEG_EXTS:
-            feed = src                      # JPEG 直接无损重编码, 省掉 PNG 中转
+            proc = _cjxl_run(src, out)
+            if proc.returncode != 0:
+                proc = _cjxl_run(src, out, ["--lossless_jpeg=0"])
+            if proc.returncode != 0:
+                png = work / "in.png"
+                _pillow_to_png(src, png)        # CMYK 等 cjxl 解不了的交给 Pillow
+                proc = _cjxl_run(png, out)
+            if proc.returncode != 0:
+                raise RuntimeError(f"cjxl 编码失败: {_cjxl_error(proc)}")
         else:
             feed = work / "in.png"
             if nw is None:
                 make_png(src, feed)
             else:
                 make_resized_png(src, feed, nw, nh)
-        out = work / "out.jxl"
-        try:
-            proc = subprocess.run(["cjxl", str(feed), str(out)],
-                                  capture_output=True, timeout=_TOOL_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"cjxl 编码超时({_TOOL_TIMEOUT} 秒)")
-        if proc.returncode != 0:
-            raise RuntimeError("cjxl 编码失败: "
-                               + proc.stderr.decode("utf-8", "replace").strip()[:160])
+            proc = _cjxl_run(feed, out)
+            if proc.returncode != 0:
+                raise RuntimeError(f"cjxl 编码失败: {_cjxl_error(proc)}")
         if not out.exists() or out.stat().st_size == 0:
             raise RuntimeError("cjxl 输出为空文件")
         replace_robust(out, dest)
@@ -531,24 +569,26 @@ def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
 
 
 def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
-               ext: str, sw: int, sh: int, stats: dict) -> str:
-    """把一张静态图片落到 target_dir, 返回动作说明。源文件由调用方删除。"""
+               ext: str, sw: int, sh: int, stats: dict):
+    """把一张静态图片落到 target_dir, 返回 (落地路径, 动作说明)。源文件由调用方删除。"""
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if w and h and (w > sw or h > sh):
         nw, nh = fit_size(w, h, sw, sh)
-        encode_jxl_to(src, unique_path(target_dir / f"{stem}.jxl"), nw, nh)
+        dest = unique_path(target_dir / f"{stem}.jxl")
+        encode_jxl_to(src, dest, nw, nh)
         stats["resized"] += 1
-        return f"缩放 {w}x{h} -> {nw}x{nh} 存 JXL"
+        return dest, f"缩放 {w}x{h} -> {nw}x{nh} 存 JXL"
 
     if ext in HIGH_COMPRESSION_EXTS:
-        move_to(src, target_dir, Path(f"{stem}{ext}"))
+        dest = move_to(src, target_dir, Path(f"{stem}{ext}"))
         stats["moved"] += 1
-        return "原样搬运"
+        return dest, "原样搬运"
 
-    encode_jxl_to(src, unique_path(target_dir / f"{stem}.jxl"))
+    dest = unique_path(target_dir / f"{stem}.jxl")
+    encode_jxl_to(src, dest)
     stats["converted"] += 1
-    return "转 JXL"
+    return dest, "转 JXL"
 
 
 def classify_extracted(tmp: Path):
@@ -637,8 +677,9 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
             if not inner:
                 break
             for p, _rel in inner:
+                # -aou: 内层解到外层目录时若重名, 自动改名而不是静默覆盖
                 proc = _run_7z(
-                    ["7z", "x", str(p), f"-o{p.parent}", "-y"],
+                    ["7z", "x", str(p), f"-o{p.parent}", "-y", "-aou"],
                     timeout=_timeout_for(p, base=_7Z_BASE_TIMEOUT, sec_per_mb=2.0))
                 if proc.returncode != 0:
                     return "error", (f"展开内层压缩包 {p.name} 失败: "
@@ -650,18 +691,20 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
             return "no_image", "包内没有静态图片(可能全是动图), 已保留压缩包"
 
         failures = []
+        created = []        # 本次为这个包产出的文件, 失败时回滚, 保证重跑不产生 _1 副本
 
         for path, rel, w, h in images:
             try:
-                emit_image(path, w, h, img_target / rel.parent,
-                           rel.stem, rel.suffix.lower(), sw, sh, stats)
+                dest, _action = emit_image(path, w, h, img_target / rel.parent,
+                                           rel.stem, rel.suffix.lower(), sw, sh, stats)
+                created.append(dest)
                 path.unlink(missing_ok=True)
-            except (OSError, RuntimeError, ValueError) as e:
+            except (OSError, RuntimeError, ValueError, MemoryError) as e:
                 failures.append((rel.as_posix(), str(e)))
 
         for path, rel, reason in broken:
             try:
-                move_to(path, broken_target, rel)
+                created.append(move_to(path, broken_target, rel))
                 stats["broken"] += 1
                 print(f"    破损: {rel.as_posix()} ({_short_error(reason, 80)})",
                       file=sys.stderr)
@@ -670,7 +713,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
 
         for path, rel in others:
             try:
-                move_to(path, other_target, rel)
+                created.append(move_to(path, other_target, rel))
             except OSError as e:
                 failures.append((rel.as_posix(), str(e)))
 
@@ -679,12 +722,16 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                 print(f"    失败: {name} ({err})", file=sys.stderr)
             if len(failures) > 5:
                 print(f"    ... 另有 {len(failures) - 5} 个失败未显示", file=sys.stderr)
-            return "error", f"{len(failures)} 个文件处理失败, 压缩包已保留"
+            _discard_created(created)
+            return "error", (f"{len(failures)} 个文件处理失败, 压缩包已保留"
+                             f"(本次产出已回滚, 修好后重跑不会产生重复文件)")
 
         try:
             archive_path.unlink()
         except OSError as e:
-            return "error", f"文件已全部处理, 但压缩包删除失败: {e}"
+            _discard_created(created)
+            return "error", (f"文件已全部处理, 但压缩包删除失败, 本次产出已回滚"
+                             f"(避免重跑产生重复): {e}")
 
         return "deleted", (f"图片 {len(images)} 个, 其他 {len(others)} 个"
                            + (f", 破损 {len(broken)} 个" if broken else ""))
@@ -806,7 +853,9 @@ def main(argv=None) -> int:
     sw, sh = screen_resolution()
     # 整个运行期间(含扫描)阻止系统空闲睡眠, 正常结束或 Ctrl+C 时在 finally 里恢复。
     # 该状态是线程级的: 万一进程先退出, 线程结束时系统也会自动清除。
+    # atexit 兜住"还没走到 finally 就 return/抛异常"的路径。
     prevent_sleep()
+    atexit.register(restore_sleep)
     images, archives = collect_files(source_root, dest_root)
 
     if not images and not archives:
@@ -865,13 +914,13 @@ def main(argv=None) -> int:
                     stats["planned"] += 1
                     continue
 
-                action = emit_image(path, w, h, dest_root / rel.parent,
-                                    rel.stem, path.suffix.lower(), sw, sh, stats)
+                _dest, action = emit_image(path, w, h, dest_root / rel.parent,
+                                            rel.stem, path.suffix.lower(), sw, sh, stats)
                 if not unlink_robust(path):
                     print(f"{prefix}  警告: 源文件被占用, 删除失败, 请手动删除",
                           file=sys.stderr)
                 print(f"{prefix}  {action}")
-            except (OSError, RuntimeError, ValueError) as e:
+            except (OSError, RuntimeError, ValueError, MemoryError) as e:
                 errors.append((rel.as_posix(), str(e)))
                 print(f"{prefix}  失败: {e}", file=sys.stderr)
             except KeyboardInterrupt:
