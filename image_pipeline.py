@@ -11,6 +11,10 @@
       * 小图 + 高压缩率格式(webp/jxl/heic/heif/avif) -> 原样搬到目标目录
       * 小图 + 其余格式(jpg/png/bmp/tif/ico...) -> 原分辨率转成 .jxl
   - 破损图片(解码失败) -> <目标目录>/_broken_images/ 下(保留相对路径), 源文件删除
+  - 打包留下的系统垃圾(__MACOSX/ 子树、任意层级的 ._ 前缀文件, 以及 .DS_Store /
+    Thumbs.db / desktop.ini 这三个白名单文件名)不是图片: 直接删除并单独计数,
+    既不算图片也不进 _broken_images; 删除前会探一次, 真能解码的图仍按图片处理。
+    白名单之外的非图片文件(视频/字幕/文档)仍按原规则处理
   - 解码内存不足的大图不判破损: 跳过校验照常转换; 转换仍失败时保留源文件、计入失败
   - 转换产物默认只做零成本的容器结构检查(截断/半截文件当场发现); 加 --verify
     才追加 jxlinfo 头部或 djxl 整图解码复核, 每张约多花 0.1~0.4 秒
@@ -274,6 +278,29 @@ def file_ext(path) -> str:
     if len(name) > 1 and name.startswith(".") and name.count(".") == 1:
         return name.lower()
     return ""
+
+
+MACOS_META_DIR = "__MACOSX"
+
+# 只认这几个白名单文件名(大小写不敏感), 其余非图片文件(视频/字幕/文档)照旧回填源目录
+JUNK_FILE_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def is_system_junk(path: Path, root: Path) -> bool:
+    """打包留下的系统垃圾: __MACOSX/ 子树、._ 前缀文件, 以及 .DS_Store 等白名单文件。
+
+    ._IMG_6758.jpg 里的 .jpg 只是原文件的扩展名, 内容是 AppleDouble 资源分叉元数据,
+    解码必然失败。当成破损图搬进 _broken_images 只是噪音, 所以在分类之前就剔除。
+    白名单之外的条目一律不算垃圾: 视频、字幕、文档仍然按"其他"回填源目录。
+    """
+    name = path.name
+    if name.lower() in JUNK_FILE_NAMES or name.startswith("._"):
+        return True
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        parts = path.parts[:-1]
+    return MACOS_META_DIR in parts
 
 
 def split_name(path):
@@ -829,11 +856,23 @@ def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
 
 
 def classify_extracted(tmp: Path):
-    """把解压出来的文件分成 (静态图片, 其他, 破损, 跳过校验数); 每项带相对路径。"""
+    """把解压出来的文件分成 (静态图片, 其他, 破损, 跳过校验数, 已删的垃圾文件数)。
+
+    系统垃圾(__MACOSX/、._ 前缀、.DS_Store/Thumbs.db/desktop.ini)直接删除, 既不进
+    图片也不进破损。删除前对图片扩展名的条目探一次: 真有能解码的图叫这个名字时按
+    图片处理, 不误删。白名单之外的"其他"文件仍按原规则回填源目录。
+    """
     images, others, broken = [], [], []
     unvalidated = 0
+    junk_removed = 0
     for path in sorted(p for p in tmp.rglob("*") if p.is_file()):
         rel = path.relative_to(tmp)
+        if is_system_junk(path, tmp) and not (
+                file_ext(path) in IMAGE_EXTS
+                and probe_image(path)[0] in ("static", "animated", "unvalidated")):
+            if unlink_robust(path):
+                junk_removed += 1
+            continue
         ext = file_ext(path)
         if ext not in IMAGE_EXTS:
             others.append((path, rel))
@@ -853,7 +892,7 @@ def classify_extracted(tmp: Path):
             if kind == "unvalidated":
                 unvalidated += 1
             images.append((path, rel, w, h))
-    return images, others, broken, unvalidated
+    return images, others, broken, unvalidated, junk_removed
 
 
 # ── 压缩包 ──────────────────────────────────────────────────────────────
@@ -907,7 +946,9 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                 return "encrypted", "密码保护/加密, 已跳过"
             return "error", f"解压失败: {_short_error(err)}"
 
-        images, others, broken, unvalidated = classify_extracted(tmp)
+        images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+        stats["junk"] += junk_removed
+        junk_total = junk_removed
 
         # 双层包: 外层一张静态图都没有时才继续展开内层, 避免拆开包里附带的 zip
         for _depth in range(MAX_NESTED_DEPTH):
@@ -926,7 +967,9 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                     return "error", (f"展开内层压缩包 {p.name} 失败: "
                                      f"{_short_error(_decode_7z(proc.stderr))}")
                 p.unlink()
-            images, others, broken, unvalidated = classify_extracted(tmp)
+            images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+            stats["junk"] += junk_removed
+            junk_total += junk_removed
         stats["unvalidated"] += unvalidated
 
         if not images and not broken:
@@ -977,7 +1020,8 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                              f"(避免重跑产生重复): {e}")
 
         return "deleted", (f"图片 {len(images)} 个, 其他 {len(others)} 个"
-                           + (f", 破损 {len(broken)} 个" if broken else ""))
+                           + (f", 破损 {len(broken)} 个" if broken else "")
+                           + (f", 清理系统垃圾 {junk_total} 个" if junk_total else ""))
     finally:
         rmtree_robust(tmp)
 
@@ -1011,13 +1055,13 @@ def _drop_stale_temp(path: Path, max_age: float = 24 * 3600) -> None:
 
 
 def collect_files(source_root: Path, target_root: Path):
-    """递归收集待处理的图片与压缩包。
+    """递归收集待处理的图片、压缩包与系统垃圾文件。
 
     用 os.walk 而不是 rglob: 必须在进入目录前剪掉链接/联接, rglob 做不到
     (实测 junction 会被反复跟进, 路径层层变长)。同时跳过目标目录(若在源目录内)
     和本脚本的临时目录, 顺手清掉过期的临时目录。
     """
-    images, archives = [], []
+    images, archives, junk = [], [], []
     target_abs = os.path.normcase(os.path.abspath(target_root))
     skipped_links = []
 
@@ -1038,11 +1082,14 @@ def collect_files(source_root: Path, target_root: Path):
 
         for name in filenames:
             p = Path(dirpath) / name
-            ext = file_ext(p)
-            if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
-                continue
             if _is_link_or_junction(p):
                 skipped_links.append(str(p))
+                continue
+            if is_system_junk(p, source_root):
+                junk.append(p)          # 系统垃圾: 稍后确认后删除
+                continue
+            ext = file_ext(p)
+            if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
                 continue
             if ext in ARCHIVE_EXTS:
                 archives.append(p)
@@ -1059,7 +1106,32 @@ def collect_files(source_root: Path, target_root: Path):
 
     images.sort()
     archives.sort(key=lambda p: (len(p.relative_to(source_root).parts), str(p)))
-    return images, archives
+    return images, archives, junk
+
+
+def _cleanup_junk_files(paths, source_root: Path) -> int:
+    """删除系统垃圾文件, 顺手收掉清空后的 __MACOSX 目录; 返回删除成功的个数。"""
+    removed = 0
+    emptied = []
+    for path in paths:
+        if not unlink_robust(path):
+            continue
+        removed += 1
+        # 只收 __MACOSX 子树内的目录(含中间的 vol/xxx 层), 由深到浅尝试删除
+        chain = []
+        for parent in path.parents:
+            if parent == source_root or source_root not in parent.parents:
+                break
+            chain.append(parent)
+            if parent.name == MACOS_META_DIR:
+                emptied.extend(chain)
+                break
+    for d in sorted(set(emptied), key=lambda p: len(p.parts), reverse=True):
+        try:
+            d.rmdir()                   # 目录非空(含没删掉的项)时失败, 忽略即可
+        except OSError:
+            pass
+    return removed
 
 
 def main(argv=None) -> int:
@@ -1106,9 +1178,25 @@ def main(argv=None) -> int:
     # atexit 兜住"还没走到 finally 就 return/抛异常"的路径。
     prevent_sleep()
     atexit.register(restore_sleep)
-    images, archives = collect_files(source_root, dest_root)
+    images, archives, junk = collect_files(source_root, dest_root)
+
+    # 系统垃圾(__MACOSX/、._ 前缀、.DS_Store/Thumbs.db/desktop.ini)不是图片, 清掉。
+    # 删之前先探一次: 万一真有能解码的图叫这个名字, 按普通图片处理, 不误删。
+    junk_files = []
+    for path in junk:
+        if (file_ext(path) in IMAGE_EXTS
+                and probe_image(path, validate=not args.dry_run)[0]
+                in ("static", "animated", "unvalidated")):
+            images.append(path)
+        else:
+            junk_files.append(path)
+    images.sort()
 
     if not images and not archives:
+        if junk_files and not args.dry_run:
+            removed = _cleanup_junk_files(junk_files, source_root)
+            print(f"源目录下没有图片或压缩包; 已清理系统垃圾 {removed} 个。")
+            return 0
         print(f"源目录 {source_root} 下没有图片或压缩包。")
         return 0
 
@@ -1127,13 +1215,23 @@ def main(argv=None) -> int:
     print(f"待处理: 图片 {len(images)} 个, 压缩包 {len(archives)} 个。\n")
 
     stats = {"resized": 0, "converted": 0, "moved": 0, "broken": 0,
-             "unvalidated": 0,
+             "unvalidated": 0, "junk": 0,
              "animated": 0, "deleted": 0, "planned": 0, "preview": 0,
              "encrypted": 0, "no_image": 0, "error": 0}
     kept = []
     errors = []
 
     try:
+        # ---- 0. 系统垃圾文件 ----
+        if junk_files:
+            if args.dry_run:
+                print(f"[预演] 将清理系统垃圾 {len(junk_files)} 个"
+                      f"(__MACOSX/、._ 前缀、.DS_Store、Thumbs.db、desktop.ini)")
+            else:
+                stats["junk"] = _cleanup_junk_files(junk_files, source_root)
+                print(f"清理系统垃圾 {stats['junk']} 个(__MACOSX/、._ 前缀、"
+                      f".DS_Store、Thumbs.db、desktop.ini; 不计入图片/破损)")
+
         # ---- 1. 目录里的散图 ----
         for idx, path in enumerate(images, 1):
             rel = path.relative_to(source_root)
@@ -1220,6 +1318,10 @@ def main(argv=None) -> int:
         if stats["unvalidated"]:
             print(f"其中 {stats['unvalidated']} 张因解码内存不足跳过了破损校验"
                   f"(头部正常, 已按图片处理)。")
+        if stats["junk"]:
+            print(f"已清理系统垃圾文件 {stats['junk']} 个"
+                  f"(__MACOSX/、._ 前缀、.DS_Store、Thumbs.db、desktop.ini; "
+                  f"不是图片, 未计入图片/破损)。")
         print(f"压缩包: 删除 {stats['deleted']} 个, 保留 {stats['encrypted'] + stats['no_image']} 个, "
               f"失败 {stats['error']} 个。")
         print(f"目标目录: {dest_root}")
