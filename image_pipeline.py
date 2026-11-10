@@ -3,7 +3,7 @@
 """图片/压缩包统一整理: 校验 -> (缩放)转 JXL / 原样搬运 -> 清空源目录。
 
 用法:
-    python image_pipeline.py <源目录> <目标目录> [--dry-run]
+    python image_pipeline.py <源目录> <目标目录> [--dry-run] [--verify]
 
 处理规则:
   - 静态图片(源目录里的, 以及压缩包里的):
@@ -12,6 +12,9 @@
       * 小图 + 其余格式(jpg/png/bmp/tif/ico...) -> 原分辨率转成 .jxl
   - 破损图片(解码失败) -> <目标目录>/_broken_images/ 下(保留相对路径), 源文件删除
   - 解码内存不足的大图不判破损: 跳过校验照常转换; 转换仍失败时保留源文件、计入失败
+  - 转换产物默认只做零成本的容器结构检查(截断/半截文件当场发现); 加 --verify
+    才追加 jxlinfo 头部或 djxl 整图解码复核, 每张约多花 0.1~0.4 秒
+  - 产物校验不通过时保留源文件、计入失败, 不移动源文件
   - 动图(多帧) -> 视为非图片: 目录里的原地不动; 压缩包里的解压回源目录
   - 压缩包 -> 解压到临时目录, 静态图片走上面同一套流程, 其余文件解压回源目录,
     全部成功后才删除压缩包; 加密/损坏/包内没有图片的包保留
@@ -563,6 +566,95 @@ def probe_jxl_info(path: Path):
     return w, h, animated
 
 
+_JXL_SIG = b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a"
+
+# 产物整图复核的像素上限: 解码代价随面积增长, 超过这个尺寸只做头部校验
+_VERIFY_FULL_DECODE_MAX_PIXELS = 10_000_000
+
+# 产物校验开关, 由 --verify 打开; 默认只做零成本的容器结构检查
+_VERIFY_OUTPUT = False
+
+
+def _check_jxl_boxes(path: Path) -> None:
+    """容器盒必须正好铺满整个文件: 写一半、被截断、尾部残留都会在这里露馅。"""
+    total = path.stat().st_size
+    with path.open("rb") as f:
+        if f.read(12) != _JXL_SIG:
+            return                      # 裸码流或其他封装, 交给 jxlinfo 判断
+        pos = 12
+        has_codestream = False
+        while pos < total:
+            f.seek(pos)
+            raw = f.read(8)
+            if len(raw) < 8:
+                raise RuntimeError(f"产物结构损坏: 偏移 {pos} 处盒头不完整")
+            box_size = int.from_bytes(raw[:4], "big")
+            box_type = raw[4:8]
+            head = 8
+            if box_size == 1:
+                ext = f.read(8)
+                if len(ext) < 8:
+                    raise RuntimeError(f"产物结构损坏: 偏移 {pos} 处 64 位盒头不完整")
+                box_size = int.from_bytes(ext, "big")
+                head = 16
+            elif box_size == 0:
+                box_size = total - pos  # 尺寸 0 表示一直到文件末尾
+            if box_size < head or pos + box_size > total:
+                raise RuntimeError(
+                    f"产物结构损坏: 偏移 {pos} 处声明 {box_size} 字节, "
+                    f"实际只剩 {total - pos} 字节")
+            if box_type in (b"jxlc", b"jxlp"):
+                has_codestream = True
+            pos += box_size
+        if not has_codestream:
+            raise RuntimeError("产物缺少 JXL 码流盒(jxlc/jxlp)")
+
+
+def verify_jxl_output(out: Path, expect=None) -> None:
+    """校验 cjxl 的产物, 不通过抛 RuntimeError(调用方保留源文件)。
+
+    结构检查(纯 Python, 微秒级)总是执行: 容器盒必须正好铺满文件, 截断/半截写入
+    当场露馅, 这一层成本可忽略所以默认保留。
+
+    --verify 打开后追加两层, 代价明显:
+      1. 整图(djxl, 约 0.1~1s): 对不超过 _VERIFY_FULL_DECODE_MAX_PIXELS 的产物
+         真解码一遍, 顺便核对解码尺寸 —— 能发现"头部正常、码流中途损坏";
+      2. 头部(jxlinfo, 约 50ms): 超出阈值的只解析头部并核对尺寸, 不整图解码。
+
+    expect 是预期显示尺寸(已按 EXIF 方向换算); 尺寸未知时传 None, 跳过比对。
+    尺寸按 (宽, 高) 排序后比较: 方向只交换宽高, 排序后比较不会把转正过的图误判。
+    """
+    if not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError("产物为空")
+
+    _check_jxl_boxes(out)
+    if not _VERIFY_OUTPUT:
+        return
+
+    pixels = expect[0] * expect[1] if expect else 0
+    if _HAS_DJXL and 0 < pixels <= _VERIFY_FULL_DECODE_MAX_PIXELS:
+        probe_png = out.with_name(f"{out.name}.verify.png")
+        try:
+            _djxl_to_png(out, probe_png)    # 解码失败会抛 RuntimeError
+            with Image.open(probe_png) as im:
+                vw, vh = im.size
+        finally:
+            probe_png.unlink(missing_ok=True)
+        if expect and sorted((vw, vh)) != sorted(expect):
+            raise RuntimeError(
+                f"产物解码尺寸 {vw}x{vh} 与预期 {expect[0]}x{expect[1]} 不符")
+        return
+
+    if _HAS_JXLINFO:
+        info = probe_jxl_info(out)
+        if info is None:
+            raise RuntimeError("jxlinfo 无法解析产物头部")
+        vw, vh = info[0], info[1]
+        if expect and sorted((vw, vh)) != sorted(expect):
+            raise RuntimeError(
+                f"产物尺寸 {vw}x{vh} 与预期 {expect[0]}x{expect[1]} 不符")
+
+
 def _djxl_to_png(src: Path, dst_png: Path) -> None:
     """用 djxl 把 JXL 解码成 PNG(Pillow 没装 JXL 插件时的解码通路)。"""
     if not _HAS_DJXL:
@@ -674,12 +766,13 @@ def _cjxl_error(proc) -> str:
     return proc.stderr.decode("utf-8", "replace").strip()[:160]
 
 
-def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
+def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None, expect=None) -> None:
     """把 src 编码成 dest(.jxl)。给了 nw/nh 时先解码缩放成 PNG 再编码。
 
     JPEG 优先让 cjxl 无损重编码; cjxl 不认的 JPEG(CMYK、异常尾部数据)逐级降级:
     无损重编码 -> 按像素无损编码(--lossless_jpeg=0) -> Pillow 解码成 PNG 再编码。
     整个中间过程都在 dest 所在目录的临时目录里完成, 最后一步是原子替换。
+    expect 为预期产物尺寸, 产物校验不通过时抛 RuntimeError, 源文件由调用方保留。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     work = make_temp_dir(dest.parent)
@@ -706,6 +799,7 @@ def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
                 raise RuntimeError(f"cjxl 编码失败: {_cjxl_error(proc)}")
         if not out.exists() or out.stat().st_size == 0:
             raise RuntimeError("cjxl 输出为空文件")
+        verify_jxl_output(out, expect)
         replace_robust(out, dest)
     finally:
         rmtree_robust(work)
@@ -719,7 +813,7 @@ def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
     if w and h and (w > sw or h > sh):
         nw, nh = fit_size(w, h, sw, sh)
         dest = unique_path(target_dir / f"{stem}.jxl")
-        encode_jxl_to(src, dest, nw, nh)
+        encode_jxl_to(src, dest, nw, nh, expect=(nw, nh))
         stats["resized"] += 1
         return dest, f"缩放 {w}x{h} -> {nw}x{nh} 存 JXL"
 
@@ -729,7 +823,7 @@ def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
         return dest, "原样搬运"
 
     dest = unique_path(target_dir / f"{stem}.jxl")
-    encode_jxl_to(src, dest)
+    encode_jxl_to(src, dest, expect=(w, h) if w and h else None)
     stats["converted"] += 1
     return dest, "转 JXL"
 
@@ -975,7 +1069,14 @@ def main(argv=None) -> int:
     parser.add_argument("dest", type=Path, help="目标目录")
     parser.add_argument("--dry-run", action="store_true",
                         help="只列出计划, 不解压、不转换、不删除")
+    parser.add_argument("--verify", action="store_true",
+                        help="转换后校验产物: 结构检查之外, 再按尺寸做头部(jxlinfo)"
+                             "或整图解码(djxl)复核, 每张约多花 0.1~0.4 秒; "
+                             "默认只做零成本的结构检查")
     args = parser.parse_args(argv)
+
+    global _VERIFY_OUTPUT
+    _VERIFY_OUTPUT = args.verify
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
