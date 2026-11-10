@@ -134,7 +134,11 @@ def restore_sleep() -> None:
 
 
 def screen_resolution():
-    """主屏物理分辨率(启用 DPI 感知以获取真实像素值)。"""
+    """主屏物理分辨率(启用 DPI 感知以获取真实像素值)。
+
+    非 Windows 走 tkinter; 无桌面环境(SSH、容器)时 tkinter 会抛 TclError,
+    此时退回 1920x1080, 不让取分辨率失败中断整批处理。
+    """
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -142,13 +146,23 @@ def screen_resolution():
             ctypes.windll.user32.SetProcessDPIAware()
         user32 = ctypes.windll.user32
         return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-    import tkinter
-    tk = tkinter.Tk()
-    tk.withdraw()
     try:
-        return tk.winfo_screenwidth(), tk.winfo_screenheight()
-    finally:
-        tk.destroy()
+        import tkinter
+    except ImportError:
+        tkinter = None
+    if tkinter is not None:
+        try:
+            tk = tkinter.Tk()
+            tk.withdraw()
+            try:
+                return tk.winfo_screenwidth(), tk.winfo_screenheight()
+            finally:
+                tk.destroy()
+        except tkinter.TclError:
+            pass
+    print("提示: 无法获取屏幕分辨率(无桌面环境), 按 1920x1080 处理。",
+          file=sys.stderr)
+    return 1920, 1080
 
 
 # ── 7z ─────────────────────────────────────────────────────────────────
@@ -386,6 +400,36 @@ def replace_robust(src: Path, dst: Path, attempts: int = 3, delay: float = 0.2) 
     raise RuntimeError(f"目标文件被占用, 替换失败: {dst.name} ({last})")
 
 
+def _rmtree_onerror(func, target, exc) -> None:
+    """rmtree 失败回调(onexc/onerror 通用): 清只读属性后重试一次。"""
+    try:
+        os.chmod(target, stat.S_IWRITE)
+    except OSError:
+        pass
+    try:
+        func(target)
+    except OSError:
+        pass
+
+
+def rmtree_robust(path: Path, attempts: int = 3, delay: float = 0.2) -> None:
+    """删除目录树, 对只读属性和瞬时占用(缩略图/索引/杀软)重试。
+
+    ignore_errors=True 会让被占用的临时目录静默留下; 目标目录内的临时目录
+    不会被下次扫描清到, 所以这里多试几次。仍失败也不抛: 残留只占空间。
+    """
+    for _ in range(attempts):
+        if not os.path.lexists(path):
+            return
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_rmtree_onerror)
+        else:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+        if not os.path.lexists(path):
+            return
+        time.sleep(delay)
+
+
 # ── 图片 ────────────────────────────────────────────────────────────────
 
 def probe_image(path: Path, validate: bool = True):
@@ -403,8 +447,10 @@ def probe_image(path: Path, validate: bool = True):
             orientation = 1
             try:
                 orientation = im.getexif().get(274, 1)
-            except (OSError, ValueError, AttributeError):
-                pass
+            except Exception:
+                # 畸形 EXIF 可能抛出任意类型(TypeError/KeyError 等);
+                # 方向只是显示细节, 读不到就按默认方向处理, 不该判成破损
+                orientation = 1
             if validate and frames <= 1:
                 im.load()
     except Image.UnidentifiedImageError as e:
@@ -481,16 +527,21 @@ def _vips_to_png(src: Path, dst_png: Path) -> None:
         del im
 
 
+def _normalize_pillow_mode(im):
+    """把 Pillow 图像统一到 L/RGB/RGBA, 供写 PNG 用(PNG 存不下 P/CMYK 等)。"""
+    if im.mode == "P":
+        return im.convert("RGBA" if "transparency" in im.info else "RGB")
+    if im.mode == "LA":
+        return im.convert("RGBA")
+    if im.mode not in ("L", "RGB", "RGBA"):
+        return im.convert("RGB")
+    return im
+
+
 def _pillow_to_png(src: Path, dst_png: Path) -> None:
     from PIL import ImageOps
     with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        if im.mode == "P":
-            im = im.convert("RGBA" if "transparency" in im.info else "RGB")
-        elif im.mode == "LA":
-            im = im.convert("RGBA")
-        elif im.mode not in ("L", "RGB", "RGBA"):
-            im = im.convert("RGB")
+        im = _normalize_pillow_mode(ImageOps.exif_transpose(im))
         im.save(dst_png, format="PNG")
 
 
@@ -521,13 +572,7 @@ def _vips_resize(src: Path, dst_png: Path, nw: int, nh: int) -> None:
 def _pillow_resize(src: Path, dst_png: Path, nw: int, nh: int) -> None:
     from PIL import ImageOps
     with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        if im.mode == "P":
-            im = im.convert("RGBA" if "transparency" in im.info else "RGB")
-        elif im.mode == "LA":
-            im = im.convert("RGBA")
-        elif im.mode not in ("L", "RGB", "RGBA"):
-            im = im.convert("RGB")
+        im = _normalize_pillow_mode(ImageOps.exif_transpose(im))
         im.resize((nw, nh), Image.Resampling.LANCZOS).save(dst_png, format="PNG")
 
 
@@ -596,7 +641,7 @@ def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
             raise RuntimeError("cjxl 输出为空文件")
         replace_robust(out, dest)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        rmtree_robust(work)
 
 
 def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
@@ -768,7 +813,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
         return "deleted", (f"图片 {len(images)} 个, 其他 {len(others)} 个"
                            + (f", 破损 {len(broken)} 个" if broken else ""))
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        rmtree_robust(tmp)
 
 
 # ── 主流程 ──────────────────────────────────────────────────────────────
@@ -794,7 +839,7 @@ def _drop_stale_temp(path: Path, max_age: float = 24 * 3600) -> None:
     """清理上次被强杀留下的临时目录; 正在运行的实例目录很新, 不会被误删。"""
     try:
         if time.time() - path.stat().st_mtime > max_age:
-            shutil.rmtree(path, ignore_errors=True)
+            rmtree_robust(path)
     except OSError:
         pass
 
