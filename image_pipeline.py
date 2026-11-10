@@ -11,6 +11,7 @@
       * 小图 + 高压缩率格式(webp/jxl/heic/heif/avif) -> 原样搬到目标目录
       * 小图 + 其余格式(jpg/png/bmp/tif/ico...) -> 原分辨率转成 .jxl
   - 破损图片(解码失败) -> <目标目录>/_broken_images/ 下(保留相对路径), 源文件删除
+  - 解码内存不足的大图不判破损: 跳过校验照常转换; 转换仍失败时保留源文件、计入失败
   - 动图(多帧) -> 视为非图片: 目录里的原地不动; 压缩包里的解压回源目录
   - 压缩包 -> 解压到临时目录, 静态图片走上面同一套流程, 其余文件解压回源目录,
     全部成功后才删除压缩包; 加密/损坏/包内没有图片的包保留
@@ -432,27 +433,88 @@ def rmtree_robust(path: Path, attempts: int = 3, delay: float = 0.2) -> None:
 
 # ── 图片 ────────────────────────────────────────────────────────────────
 
+# 各模式解码后每像素占用的字节数, 用于估算整图解码的内存需求
+_MODE_BYTES = {"1": 1, "L": 1, "LA": 2, "P": 1, "PA": 2, "RGB": 3, "RGBX": 4,
+               "RGBA": 4, "CMYK": 4, "YCbCr": 3, "I": 4, "F": 4,
+               "I;16": 2, "I;16B": 2, "I;16L": 2}
+
+# 解码内存上限: 估算需求超过可用物理内存的这个比例就跳过校验
+_MEMORY_HEADROOM = 0.4
+
+
+def decode_cost(w: int, h: int, mode: str) -> int:
+    """估算整图解码的内存需求(字节): 像素数 × 每像素字节, 再留 60% 余量。"""
+    return int(w * h * _MODE_BYTES.get(mode, 4) * 1.6)
+
+
+def available_bytes():
+    """当前可用物理内存(字节); 非 Windows 或调用失败返回 None。"""
+    if sys.platform != "win32":
+        return None
+
+    class _MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    st = _MemStatus()
+    st.dwLength = ctypes.sizeof(_MemStatus)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+    except OSError:
+        return None
+    return int(st.ullAvailPhys)
+
+
+def _gb(n: int) -> float:
+    return n / (1024 ** 3)
+
+
 def probe_image(path: Path, validate: bool = True):
-    """返回 (kind, w, h, reason); kind ∈ static / animated / broken / unverified。
+    """返回 (kind, w, h, reason); kind ∈ static / animated / broken /
+    unverified / unvalidated。
 
     validate=False 只看文件头(预演用); True 会完整解码, 截断/损坏在这时暴露。
     w/h 已按 EXIF 方向换算成显示尺寸。
     JXL 走 jxlinfo 读尺寸(Pillow 通常没有 JXL 解码器), 只校验文件头。
+
+    unvalidated 表示头部正常、尺寸已知, 但因解码内存不足跳过了完整校验。
+    这种图仍然按图片处理(源文件不挪走), 只有真正解不开的才判 broken。
     """
     ext = file_ext(path)
     try:
         with Image.open(path) as im:
             frames = getattr(im, "n_frames", 1) if ext in ANIMATABLE_EXTS else 1
             w, h = im.size
+            cost = decode_cost(w, h, im.mode)
+            avail = available_bytes()
+            # 解码内存必然吃紧: 先别碰像素, 连 EXIF 也不读
+            # (PNG 的 getexif() 内部会 load() 整图, 大图会先被换页拖几十秒)
+            starved = bool(avail) and cost > avail * _MEMORY_HEADROOM
+            if validate and starved:
+                return ("unvalidated", w, h,
+                        f"解码约需 {_gb(cost):.1f} GB, 可用 {_gb(avail):.1f} GB, "
+                        f"跳过解码校验")
             orientation = 1
-            try:
-                orientation = im.getexif().get(274, 1)
-            except Exception:
-                # 畸形 EXIF 可能抛出任意类型(TypeError/KeyError 等);
-                # 方向只是显示细节, 读不到就按默认方向处理, 不该判成破损
-                orientation = 1
+            if not starved:
+                try:
+                    orientation = im.getexif().get(274, 1)
+                except Exception:
+                    # 畸形 EXIF 可能抛出任意类型(TypeError/KeyError 等);
+                    # 方向只是显示细节, 读不到就按默认方向处理, 不该判成破损
+                    orientation = 1
             if validate and frames <= 1:
-                im.load()
+                try:
+                    im.load()
+                except MemoryError:
+                    return ("unvalidated", w, h,
+                            f"解码约需 {_gb(cost):.1f} GB, 内存不足, 跳过解码校验")
     except Image.UnidentifiedImageError as e:
         if ext == ".jxl":
             info = probe_jxl_info(path)
@@ -461,8 +523,13 @@ def probe_image(path: Path, validate: bool = True):
                 return ("animated" if animated else "static"), jw, jh, ""
         return "unverified", 0, 0, f"Pillow 无法识别: {e}"
     except MemoryError:
-        return "broken", 0, 0, "解码时内存不足"
+        # 连文件头都没读出来, 尺寸未知; 仍按图片处理, 不判破损
+        return "unvalidated", 0, 0, "解码时内存不足, 跳过解码校验"
+    except Image.DecompressionBombError as e:
+        return "unvalidated", 0, 0, f"像素数超出解压炸弹阈值: {e}"
     except (OSError, ValueError, SyntaxError) as e:
+        if isinstance(e, OSError) and getattr(e, "errno", None) == 12:
+            return "unvalidated", 0, 0, "操作系统内存不足, 跳过解码校验"
         return "broken", 0, 0, f"{type(e).__name__}: {e}"
     if orientation in (5, 6, 7, 8):
         w, h = h, w
@@ -668,8 +735,9 @@ def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
 
 
 def classify_extracted(tmp: Path):
-    """把解压出来的文件分成 (静态图片, 其他, 破损); 每项带相对路径。"""
+    """把解压出来的文件分成 (静态图片, 其他, 破损, 跳过校验数); 每项带相对路径。"""
     images, others, broken = [], [], []
+    unvalidated = 0
     for path in sorted(p for p in tmp.rglob("*") if p.is_file()):
         rel = path.relative_to(tmp)
         ext = file_ext(path)
@@ -687,8 +755,11 @@ def classify_extracted(tmp: Path):
             else:
                 broken.append((path, rel, reason))
         else:
+            # unvalidated: 内存不足跳过解码校验, 不是坏文件, 照常按图片处理
+            if kind == "unvalidated":
+                unvalidated += 1
             images.append((path, rel, w, h))
-    return images, others, broken
+    return images, others, broken, unvalidated
 
 
 # ── 压缩包 ──────────────────────────────────────────────────────────────
@@ -742,7 +813,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                 return "encrypted", "密码保护/加密, 已跳过"
             return "error", f"解压失败: {_short_error(err)}"
 
-        images, others, broken = classify_extracted(tmp)
+        images, others, broken, unvalidated = classify_extracted(tmp)
 
         # 双层包: 外层一张静态图都没有时才继续展开内层, 避免拆开包里附带的 zip
         for _depth in range(MAX_NESTED_DEPTH):
@@ -761,7 +832,8 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                     return "error", (f"展开内层压缩包 {p.name} 失败: "
                                      f"{_short_error(_decode_7z(proc.stderr))}")
                 p.unlink()
-            images, others, broken = classify_extracted(tmp)
+            images, others, broken, unvalidated = classify_extracted(tmp)
+        stats["unvalidated"] += unvalidated
 
         if not images and not broken:
             return "no_image", "包内没有静态图片(可能全是动图), 已保留压缩包"
@@ -954,6 +1026,7 @@ def main(argv=None) -> int:
     print(f"待处理: 图片 {len(images)} 个, 压缩包 {len(archives)} 个。\n")
 
     stats = {"resized": 0, "converted": 0, "moved": 0, "broken": 0,
+             "unvalidated": 0,
              "animated": 0, "deleted": 0, "planned": 0, "preview": 0,
              "encrypted": 0, "no_image": 0, "error": 0}
     kept = []
@@ -970,6 +1043,11 @@ def main(argv=None) -> int:
                     stats["animated"] += 1
                     print(f"{prefix}  动图, 留在源目录")
                     continue
+
+                if kind == "unvalidated":
+                    # 内存不足跳过解码校验: 不是坏文件, 照常按图片处理
+                    stats["unvalidated"] += 1
+                    print(f"{prefix}  {reason}, 仍按图片处理")
 
                 if kind == "unverified" and file_ext(path) in HIGH_COMPRESSION_EXTS:
                     # 没有解码器(如未装 pillow_heif): 校验不了, 但格式本身已压好, 按原样搬运
@@ -1038,6 +1116,9 @@ def main(argv=None) -> int:
         print(f"完成: 缩放 {stats['resized']} 张, 转 JXL {stats['converted']} 张, "
               f"原样搬运 {stats['moved']} 张, 破损 {stats['broken']} 张, "
               f"动图 {stats['animated']} 张留在源目录。")
+        if stats["unvalidated"]:
+            print(f"其中 {stats['unvalidated']} 张因解码内存不足跳过了破损校验"
+                  f"(头部正常, 已按图片处理)。")
         print(f"压缩包: 删除 {stats['deleted']} 个, 保留 {stats['encrypted'] + stats['no_image']} 个, "
               f"失败 {stats['error']} 个。")
         print(f"目标目录: {dest_root}")
