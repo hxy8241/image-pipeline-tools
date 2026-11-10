@@ -243,13 +243,44 @@ def archive_label(path: Path) -> str:
             return name
 
 
+def file_ext(path) -> str:
+    """返回小写扩展名(带点), 能识别 ".jpeg" 这种只有扩展名、没有主名的文件。
+
+    Path(".jpeg").suffix 返回空串(Python 把点开头且再无其他点的名字整体当主名),
+    直接用它判断会让这类条目被当成非图片, 原样留在包里/源目录。
+    """
+    name = Path(path).name
+    suffix = Path(name).suffix.lower()
+    if suffix:
+        return suffix
+    if len(name) > 1 and name.startswith(".") and name.count(".") == 1:
+        return name.lower()
+    return ""
+
+
+def split_name(path):
+    """返回 (主名, 小写扩展名)。
+
+    纯扩展名文件名(如 ".jpeg")没有主名, 主名取扩展名本身去掉前导点,
+    使产物成为 jpeg.jxl 而不是隐藏文件式的 ".jpeg.jxl"。
+    """
+    ext = file_ext(path)
+    if ext and not Path(path).suffix:
+        return ext[1:], ext
+    return Path(path).stem, ext
+
+
 # ── 文件系统 ────────────────────────────────────────────────────────────
 
 def unique_path(dest: Path) -> Path:
-    """目标已存在时追加 _1、_2..., 绝不覆盖。"""
+    """目标已存在时追加 _1、_2..., 绝不覆盖。
+
+    用 split_name 取主名/扩展名: 直接取 Path.stem 会把 ".jpeg" 变成 ".jpeg_1"
+    (既丢扩展名又成了隐藏文件), 变成 ".jpeg_1.jpeg" 则两者都保留。
+    """
     if not os.path.lexists(dest):
         return dest
-    stem, suffix = dest.stem, dest.suffix
+    stem, suffix = split_name(dest)
     for i in range(1, 10000):
         candidate = dest.with_name(f"{stem}_{i}{suffix}")
         if not os.path.lexists(candidate):
@@ -364,7 +395,7 @@ def probe_image(path: Path, validate: bool = True):
     w/h 已按 EXIF 方向换算成显示尺寸。
     JXL 走 jxlinfo 读尺寸(Pillow 通常没有 JXL 解码器), 只校验文件头。
     """
-    ext = path.suffix.lower()
+    ext = file_ext(path)
     try:
         with Image.open(path) as im:
             frames = getattr(im, "n_frames", 1) if ext in ANIMATABLE_EXTS else 1
@@ -470,7 +501,7 @@ def make_png(src: Path, dst_png: Path) -> None:
             return
         except (pyvips.Error, OSError):
             pass
-    if src.suffix.lower() == ".jxl":
+    if file_ext(src) == ".jxl":
         _djxl_to_png(src, dst_png)      # Pillow 没有 JXL 解码器时走 djxl
         return
     _pillow_to_png(src, dst_png)
@@ -507,7 +538,7 @@ def make_resized_png(src: Path, dst_png: Path, nw: int, nh: int) -> None:
             return
         except (pyvips.Error, OSError):
             pass
-    if src.suffix.lower() == ".jxl":
+    if file_ext(src) == ".jxl":
         # Pillow 打不开 JXL: 先 djxl 解码成原尺寸 PNG, 再缩放
         full = dst_png.with_name(dst_png.name + ".full.png")
         try:
@@ -542,7 +573,7 @@ def encode_jxl_to(src: Path, dest: Path, nw=None, nh=None) -> None:
     work = make_temp_dir(dest.parent)
     try:
         out = work / "out.jxl"
-        if nw is None and src.suffix.lower() in JPEG_EXTS:
+        if nw is None and file_ext(src) in JPEG_EXTS:
             proc = _cjxl_run(src, out)
             if proc.returncode != 0:
                 proc = _cjxl_run(src, out, ["--lossless_jpeg=0"])
@@ -596,7 +627,7 @@ def classify_extracted(tmp: Path):
     images, others, broken = [], [], []
     for path in sorted(p for p in tmp.rglob("*") if p.is_file()):
         rel = path.relative_to(tmp)
-        ext = path.suffix.lower()
+        ext = file_ext(path)
         if ext not in IMAGE_EXTS:
             others.append((path, rel))
             continue
@@ -635,8 +666,8 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
     if encrypted:
         return "encrypted", "密码保护/加密, 已跳过"
 
-    image_candidates = [n for n in entries if Path(n).suffix.lower() in IMAGE_EXTS]
-    nested = [n for n in entries if Path(n).suffix.lower() in ARCHIVE_EXTS]
+    image_candidates = [n for n in entries if file_ext(n) in IMAGE_EXTS]
+    nested = [n for n in entries if file_ext(n) in ARCHIVE_EXTS]
     # tar.gz 这类双层包: 7z 只把内层 vol1.tar 列为条目, 图片在它里面
     if not image_candidates and not nested:
         return "no_image", "包内没有图片, 已保留"
@@ -673,7 +704,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
             if images:
                 break
             inner = [(p, rel) for p, rel in others
-                     if p.suffix.lower() in ARCHIVE_EXTS]
+                     if file_ext(p) in ARCHIVE_EXTS]
             if not inner:
                 break
             for p, _rel in inner:
@@ -695,8 +726,9 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
 
         for path, rel, w, h in images:
             try:
+                stem, ext = split_name(rel)
                 dest, _action = emit_image(path, w, h, img_target / rel.parent,
-                                           rel.stem, rel.suffix.lower(), sw, sh, stats)
+                                           stem, ext, sw, sh, stats)
                 created.append(dest)
                 path.unlink(missing_ok=True)
             except (OSError, RuntimeError, ValueError, MemoryError) as e:
@@ -795,7 +827,7 @@ def collect_files(source_root: Path, target_root: Path):
 
         for name in filenames:
             p = Path(dirpath) / name
-            ext = p.suffix.lower()
+            ext = file_ext(p)
             if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
                 continue
             if _is_link_or_junction(p):
@@ -894,7 +926,7 @@ def main(argv=None) -> int:
                     print(f"{prefix}  动图, 留在源目录")
                     continue
 
-                if kind == "unverified" and path.suffix.lower() in HIGH_COMPRESSION_EXTS:
+                if kind == "unverified" and file_ext(path) in HIGH_COMPRESSION_EXTS:
                     # 没有解码器(如未装 pillow_heif): 校验不了, 但格式本身已压好, 按原样搬运
                     kind, w, h = "static", 0, 0
 
@@ -910,12 +942,13 @@ def main(argv=None) -> int:
                     continue
 
                 if args.dry_run:
-                    print(f"{prefix}  预演: {describe_plan(w, h, path.suffix.lower(), sw, sh)}")
+                    print(f"{prefix}  预演: {describe_plan(w, h, file_ext(path), sw, sh)}")
                     stats["planned"] += 1
                     continue
 
+                stem, ext = split_name(rel)
                 _dest, action = emit_image(path, w, h, dest_root / rel.parent,
-                                            rel.stem, path.suffix.lower(), sw, sh, stats)
+                                            stem, ext, sw, sh, stats)
                 if not unlink_robust(path):
                     print(f"{prefix}  警告: 源文件被占用, 删除失败, 请手动删除",
                           file=sys.stderr)

@@ -208,6 +208,19 @@ def group_small_folders(small_folders, target):
     return groups
 
 
+def _split_ext(filename):
+    """拆出 (主名, 扩展名)，能正确处理 ".jpeg" 这类只有扩展名、没有主名的文件名。
+
+    os.path.splitext(".jpeg") 返回 (".jpeg", "")，据此生成的断名会是 ".jpeg_1"
+    —— 既丢了扩展名又成了隐藏文件，后续按扩展名识别图片/压缩包的工具就认不出来。
+    这里把 ".jpeg" 的主名视为空、扩展名视为 ".jpeg"，断名变成 "_1.jpeg"。
+    """
+    stem, ext = os.path.splitext(filename)
+    if not ext and len(stem) > 1 and stem.startswith(".") and stem.count(".") == 1:
+        return "", stem
+    return stem, ext
+
+
 class NameRegistry:
     """按目录跟踪已占用的文件名，平铺合并时避免重名覆盖，且避免 O(N^2) 磁盘 I/O。"""
 
@@ -220,7 +233,7 @@ class NameRegistry:
         if used is None:
             used = set(os.listdir(key)) if os.path.isdir(key) else set()
             self._used[key] = used
-        name, ext = os.path.splitext(filename)
+        name, ext = _split_ext(filename)
         candidate = filename
         counter = 1
         while candidate in used:
@@ -552,7 +565,7 @@ def build_destination(bucket_dir, filename):
     dest = os.path.join(bucket_dir, filename)
     if not os.path.lexists(dest):
         return dest
-    stem, ext = os.path.splitext(filename)
+    stem, ext = _split_ext(filename)
     for i in range(1, 10000):
         candidate = os.path.join(bucket_dir, f"{stem}__dup{i}{ext}")
         if not os.path.lexists(candidate):
