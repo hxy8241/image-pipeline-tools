@@ -45,6 +45,7 @@ import argparse
 import atexit
 import ctypes
 import errno
+import io
 import os
 import re
 import shutil
@@ -713,8 +714,36 @@ def _vips_to_png(src: Path, dst_png: Path) -> None:
         del im
 
 
+def _cmyk_to_rgb(im):
+    """CMYK -> sRGB: 有 ICC 配置文件就按配置文件转换, 否则用 Pillow 的默认公式。
+
+    带配置文件的 CMYK 图(印刷流程导出的 JPG 基本都有)直接 convert("RGB") 会偏色,
+    必须走 ImageCms 才能和原图一致。
+    """
+    icc = im.info.get("icc_profile")
+    if not icc:
+        return im.convert("RGB")
+    try:
+        from PIL import ImageCms
+    except ImportError:
+        return im.convert("RGB")
+    try:
+        src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        return ImageCms.profileToProfile(im, src,
+                                        ImageCms.createProfile("sRGB"),
+                                        outputMode="RGB")
+    except Exception:            # 配置文件损坏/不受支持: 退回默认公式, 不因此失败
+        return im.convert("RGB")
+
+
 def _normalize_pillow_mode(im):
     """把 Pillow 图像统一到 L/RGB/RGBA, 供写 PNG 用(PNG 存不下 P/CMYK 等)。"""
+    if im.mode == "CMYK":
+        rgb = _cmyk_to_rgb(im)
+        # 转成 RGB 后必须丢掉原来的 CMYK 配置文件: 带着写进 PNG 会让 cjxl 直接拒收
+        # (libpng: 'CMYK': invalid ICC profile color space -> Getting pixel data failed)
+        rgb.info.pop("icc_profile", None)
+        return rgb
     if im.mode == "P":
         return im.convert("RGBA" if "transparency" in im.info else "RGB")
     if im.mode == "LA":
