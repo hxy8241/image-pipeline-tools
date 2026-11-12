@@ -234,6 +234,7 @@ def _parse_slt(text: str):
     entries = []
     encrypted = False
     block = {}
+    last_key = None
 
     def flush(b):
         if b.get("Path") and b.get("Folder") != "+" and "Physical Size" not in b:
@@ -246,10 +247,16 @@ def _parse_slt(text: str):
             if block and "Path" in block:
                 encrypted = flush(block) or encrypted
                 block = {}
+            last_key = None
             continue
         if " = " in line:
             k, v = line.split(" = ", 1)
             block[k] = v
+            last_key = k
+        elif last_key == "Path" and block.get("Path"):
+            # 文件名本身含换行时, -slt 会把续行单独输出。拼回去, 否则这条目
+            # 丢掉扩展名, 整包可能被误判成"没有图片"而永远不被处理。
+            block["Path"] += "\n" + line
     if block and "Path" in block:
         encrypted = flush(block) or encrypted
     return entries, encrypted
@@ -263,7 +270,10 @@ def archive_label(path: Path) -> str:
         if p.suffix.lower() in _STRIP_SUFFIXES:
             name = p.stem
         else:
-            return name
+            break
+    # Windows 存不住以空格/点结尾的目录名: mkdir("x ") 会静默建出 "x", 之后
+    # "x \tmp" 这样的子路径就找不到(报 WinError 3, 整个包处理失败)。这里统一裁掉。
+    return name.rstrip(" .") or "archive"
 
 
 def file_ext(path) -> str:
@@ -965,8 +975,11 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
 
     tmp = make_temp_dir(archive_path.parent)
     try:
+        # -aou: 包内条目在 Windows 上撞名时自动改名而不是静默覆盖。
+        # 例如 dup.jpg / DUP.JPG(大小写不敏感)、a:b.jpg / a?b.jpg(非法字符都被换成 _),
+        # 不加这个开关只会落地两个文件, 另一张图连同压缩包一起消失。
         proc = _run_7z(
-            ["7z", "x", str(archive_path), f"-o{tmp}", "-y"],
+            ["7z", "x", str(archive_path), f"-o{tmp}", "-y", "-aou"],
             timeout=_timeout_for(archive_path, base=_7Z_BASE_TIMEOUT,
                                  sec_per_mb=2.0, entries=len(entries)))
         if proc.returncode != 0:
