@@ -894,6 +894,34 @@ def emit_image(src: Path, w: int, h: int, target_dir: Path, stem: str,
     return dest, "转 JXL"
 
 
+def _raise_walk_error(err: OSError) -> None:
+    raise err
+
+
+def _iter_files_strict(root: Path, attempts: int = 3, delay: float = 1.0):
+    """递归列出 root 下所有文件; 任一目录读取失败都抛 OSError。
+
+    Path.rglob 和 os.walk(onerror=None) 都会把"读不到目录"静默当成空目录。
+    网络共享(SMB)抖一下、报一句 "无效签名", 解压出来明明有几百张图, 却会
+    被判成"包内没有静态图片"而保留压缩包, 且删不掉临时目录。宁可重试后报错,
+    也不能把读取失败伪装成空目录。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            files = []
+            for dirpath, _dirnames, filenames in os.walk(
+                    root, onerror=_raise_walk_error):
+                for name in filenames:
+                    files.append(Path(dirpath) / name)
+            return files
+        except OSError as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(delay * (i + 1))
+    raise last
+
+
 def classify_extracted(tmp: Path):
     """把解压出来的文件分成 (静态图片, 其他, 破损, 跳过校验数, 已删的垃圾文件数)。
 
@@ -904,7 +932,7 @@ def classify_extracted(tmp: Path):
     images, others, broken = [], [], []
     unvalidated = 0
     junk_removed = 0
-    for path in sorted(p for p in tmp.rglob("*") if p.is_file()):
+    for path in sorted(_iter_files_strict(tmp)):
         rel = path.relative_to(tmp)
         if is_system_junk(path, tmp) and not (
                 file_ext(path) in IMAGE_EXTS
@@ -988,7 +1016,13 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                 return "encrypted", "密码保护/加密, 已跳过"
             return "error", f"解压失败: {_short_error(err)}"
 
-        images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+        # 读取解压目录失败(网络共享抖动)必须当错误处理: 若静默返回空, 会走到下面
+        # "没有静态图片"而保留压缩包, 让人误以为包里没图。
+        try:
+            images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+        except OSError as e:
+            return "error", (f"无法读取解压目录(网络共享可能不稳定), 压缩包已保留: "
+                             f"{_short_error(str(e), 120)}")
         stats["junk"] += junk_removed
         junk_total = junk_removed
 
@@ -1009,7 +1043,11 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                     return "error", (f"展开内层压缩包 {p.name} 失败: "
                                      f"{_short_error(_decode_7z(proc.stderr))}")
                 p.unlink()
-            images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+            try:
+                images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
+            except OSError as e:
+                return "error", (f"无法读取解压目录(网络共享可能不稳定), 压缩包已保留: "
+                                 f"{_short_error(str(e), 120)}")
             stats["junk"] += junk_removed
             junk_total += junk_removed
         stats["unvalidated"] += unvalidated
@@ -1066,6 +1104,10 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                            + (f", 清理系统垃圾 {junk_total} 个" if junk_total else ""))
     finally:
         rmtree_robust(tmp)
+        if os.path.lexists(tmp):
+            # 网络共享出错时连临时目录都删不掉, 不能静默留一个 1GB 的垃圾目录
+            print(f"    警告: 临时目录未能删除(网络共享可能不稳定), 请手工清理: {tmp}",
+                  file=sys.stderr)
 
 
 # ── 主流程 ──────────────────────────────────────────────────────────────
@@ -1106,8 +1148,13 @@ def collect_files(source_root: Path, target_root: Path):
     images, archives, junk = [], [], []
     target_abs = os.path.normcase(os.path.abspath(target_root))
     skipped_links = []
+    walk_errors = []
 
-    for dirpath, dirnames, filenames in os.walk(source_root, topdown=True):
+    def _on_walk_error(err: OSError) -> None:
+        walk_errors.append(err)
+
+    for dirpath, dirnames, filenames in os.walk(
+            source_root, topdown=True, onerror=_on_walk_error):
         keep = []
         for name in dirnames:
             full = os.path.join(dirpath, name)
@@ -1145,6 +1192,15 @@ def collect_files(source_root: Path, target_root: Path):
             print(f"  · {s}", file=sys.stderr)
         if len(skipped_links) > 5:
             print(f"  ... 另有 {len(skipped_links) - 5} 个", file=sys.stderr)
+
+    if walk_errors:
+        # 读不到就明说: 否则会表现成"待处理 0 个", 像是源目录已经空了
+        print(f"警告: {len(walk_errors)} 个目录读取失败(网络共享可能不稳定), "
+              f"其中的文件本次未处理:", file=sys.stderr)
+        for e in walk_errors[:5]:
+            print(f"  · {e}", file=sys.stderr)
+        if len(walk_errors) > 5:
+            print(f"  ... 另有 {len(walk_errors) - 5} 个", file=sys.stderr)
 
     images.sort()
     archives.sort(key=lambda p: (len(p.relative_to(source_root).parts), str(p)))
