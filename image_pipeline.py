@@ -38,6 +38,10 @@
   - 源目录里的符号链接/目录联接(junction)一律跳过, 不处理其内容
     (rglob 会跟进联接, 指向父目录会无限深入, 指向树外会误删树外文件)
   - 上次被强杀留下的 __pipeline_tmp_* 目录会在启动扫描时自动清理(超过 24 小时)
+  - 目录枚举走 FindFirstFileExW 的大缓冲模式: macOS/Linux 的 SMB 服务端在
+    "分片续查"响应上签名不合规, 默认的小缓冲枚举在几百条以上的大目录里会报
+    WinError -2146893818("无效签名"), 而 cmd dir / 资源管理器却正常;
+    大缓冲一次拉一大批, 不触发续查
   - 空目录不还原
 """
 
@@ -126,6 +130,8 @@ _NETWORK_ERROR_HINTS = (
     "无法访问", "网络位置", "网络路径", "找不到网络", "网络名",
     "path not found", "cannot find the path", "network path", "network name",
     "is not available", "unavailable",
+    # macOS/Linux 的 smbd 在分片续查响应上签名不合规, 新版 Windows 客户端会拒收
+    "无效签名", "invalid signature",
 )
 
 
@@ -194,6 +200,14 @@ def _is_encrypted_error(err_msg: str) -> bool:
 
 def _short_error(text: str, limit: int = 200) -> str:
     return " ".join(text.split())[:limit]
+
+
+def _smb_signature_note(exc: BaseException) -> str:
+    """读目录失败时的原因注脚: 别把 SMB 签名校验失败说成"网络抖了一下"。"""
+    if _is_smb_signature_error(exc):
+        return ("(SMB 分片响应签名校验失败, WinError -2146893818; "
+                "目录枚举已用大缓冲, 仍失败说明服务端这道响应确实不合规)")
+    return "(网络共享可能不稳定)"
 
 
 def _run_7z(cmd, timeout):
@@ -326,6 +340,209 @@ def split_name(path):
     return Path(path).stem, ext
 
 
+# ── 目录枚举 ────────────────────────────────────────────────────────────
+#
+# Windows 有两种目录枚举缓冲。默认的小缓冲一次只取几条, 大目录要靠"续查"补齐;
+# macOS/Linux 的 SMB 服务端对续查响应的 SMB2 签名不合规, 新版 Windows 客户端
+# 验不过, 于是报 WinError -2146893818 (NTE_BAD_SIGNATURE, "无效签名")。
+# 实测: 一个响应装得下的目录(400 条以内)没事, 952 条的解压目录必炸, 而
+# cmd dir / robocopy(都用大缓冲)却列得出来 —— 这就是"手动能打开、脚本读不了"。
+# FIND_FIRST_EX_LARGE_FETCH 一次拉一大批, 不走续查, 所以这里统一用它枚举。
+
+_ENTRY_DIR = 0x01             # 目录
+_ENTRY_REPARSE = 0x02         # 符号链接 / 目录联接 / 挂载点
+
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FIND_EX_INFO_STANDARD = 0
+_FIND_EX_SEARCH_NAME_MATCH = 0
+_FIND_FIRST_EX_LARGE_FETCH = 0x2
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_NO_MORE_FILES = 18
+# NTE_BAD_SIGNATURE: Python 按有符号整数暴露成 -2146893818
+_SMB_BAD_SIGNATURE = 0x80090006
+
+# None: 尚未初始化; False: 不可用(非 Windows / 加载失败); dict: 可用
+_FIND_API = None
+_FIND_API_READY = False
+
+
+def _is_smb_signature_error(exc: BaseException) -> bool:
+    """是否为 SMB 分片响应签名校验失败(0x80090006 / WinError -2146893818)。"""
+    code = getattr(exc, "winerror", None)
+    if isinstance(code, int) and (code & 0xFFFFFFFF) == _SMB_BAD_SIGNATURE:
+        return True
+    text = str(exc).lower()
+    return "无效签名" in text or "invalid signature" in text
+
+
+def _win_find_api():
+    """懒加载 FindFirstFileExW/FindNextFileW/FindClose; 不可用时返回 False。"""
+    global _FIND_API, _FIND_API_READY
+    if _FIND_API_READY:
+        return _FIND_API
+    _FIND_API_READY = True
+    _FIND_API = False
+    if os.name != "nt":
+        return _FIND_API
+    try:
+        from ctypes import wintypes
+
+        class WIN32_FIND_DATAW(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("dwReserved0", wintypes.DWORD),
+                ("dwReserved1", wintypes.DWORD),
+                ("cFileName", wintypes.WCHAR * 260),
+                ("cAlternateFileName", wintypes.WCHAR * 14),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.FindFirstFileExW.restype = ctypes.c_void_p
+        kernel32.FindFirstFileExW.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(WIN32_FIND_DATAW),
+            ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.FindNextFileW.restype = wintypes.BOOL
+        kernel32.FindNextFileW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(WIN32_FIND_DATAW)]
+        kernel32.FindClose.restype = wintypes.BOOL
+        kernel32.FindClose.argtypes = [ctypes.c_void_p]
+    except (AttributeError, OSError, ValueError):
+        return _FIND_API
+    _FIND_API = {
+        "find_first": kernel32.FindFirstFileExW,
+        "find_next": kernel32.FindNextFileW,
+        "find_close": kernel32.FindClose,
+        "data": WIN32_FIND_DATAW,
+        "invalid": (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1,
+    }
+    return _FIND_API
+
+
+def _win_dir_pattern(dirpath):
+    """把目录转成 FindFirstFileExW 的 "dir\\*" 模式; 名字带通配符时返回 None。"""
+    path = os.fspath(dirpath)
+    if "*" in path or "?" in path:
+        return None                 # 会被当成匹配模式, 交给 os.scandir
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    if len(path) >= 240:            # 长路径要 \\?\ 前缀, 否则超过 MAX_PATH 直接失败
+        if path.startswith("\\\\"):
+            path = "\\\\?\\UNC\\" + path[2:]
+        else:
+            path = "\\\\?\\" + path
+    return path.rstrip("\\/") + "\\*"
+
+
+def _win_oserror(err: int, path) -> OSError:
+    """按 Win32 错误码构造 OSError, 保留 winerror 供上层识别错误类型。"""
+    exc = ctypes.WinError(err)
+    exc.filename = os.fspath(path)
+    return exc
+
+
+def _entry_flags(attributes: int) -> int:
+    flags = 0
+    if attributes & _FILE_ATTRIBUTE_DIRECTORY:
+        flags |= _ENTRY_DIR
+    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        flags |= _ENTRY_REPARSE
+    return flags
+
+
+def _iter_entries(dirpath):
+    """逐条列出 dirpath 的子项 (名字, 标志位); 读目录失败抛 OSError。
+
+    Windows 上走 FIND_FIRST_EX_LARGE_FETCH(原因见本节开头); 非 Windows、或
+    路径里带 "*"/"?" 时退回 os.scandir。
+    """
+    api = _win_find_api()
+    pattern = _win_dir_pattern(dirpath) if api else None
+    if not pattern:
+        with os.scandir(dirpath) as entries:
+            for entry in entries:
+                flags = 0
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        flags |= _ENTRY_DIR
+                except OSError:
+                    pass
+                try:
+                    if entry.is_symlink():
+                        flags |= _ENTRY_REPARSE
+                except OSError:
+                    pass
+                yield entry.name, flags
+        return
+
+    data = api["data"]()
+    handle = api["find_first"](pattern, _FIND_EX_INFO_STANDARD,
+                               ctypes.byref(data), _FIND_EX_SEARCH_NAME_MATCH,
+                               None, _FIND_FIRST_EX_LARGE_FETCH)
+    if not handle or handle == api["invalid"]:
+        err = ctypes.get_last_error()
+        if err in (_ERROR_FILE_NOT_FOUND, _ERROR_NO_MORE_FILES):
+            return                                  # 空目录
+        raise _win_oserror(err, dirpath)
+    try:
+        while True:
+            # FindFirstFileExW 会返回 "." 和 ".."(os.scandir 不会), 不滤掉会让
+            # 遍历自己递归进自己 / 往上爬到父目录
+            name = data.cFileName
+            if name not in (".", ".."):
+                yield name, _entry_flags(data.dwFileAttributes)
+            if not api["find_next"](handle, ctypes.byref(data)):
+                err = ctypes.get_last_error()
+                if err in (0, _ERROR_NO_MORE_FILES):
+                    return
+                raise _win_oserror(err, dirpath)
+    finally:
+        api["find_close"](handle)
+
+
+def _list_entries(dirpath):
+    """一次列全一个目录; 失败抛 OSError。"""
+    return list(_iter_entries(dirpath))
+
+
+def _walk_tree(root, prune=None, onerror=None):
+    """os.walk(topdown=True) 的等价物, 但目录枚举走 _iter_entries(大缓冲)。
+
+    prune(dirpath, name, flags) 返回 True 表示不进入该子目录;
+    onerror 为 None 时任何读取失败都抛出, 否则交给 onerror 后跳过该目录。
+    符号链接/目录联接会出现在 dirnames 里, 但不会跟进去(同 os.walk 默认)。
+    """
+    root = Path(root)
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = _list_entries(cur)
+        except OSError as exc:
+            if onerror is None:
+                raise
+            onerror(exc)
+            continue
+        dirnames, filenames, descend = [], [], []
+        for name, flags in entries:
+            if flags & _ENTRY_DIR:
+                if prune is not None and prune(cur, name, flags):
+                    continue
+                dirnames.append(name)
+                if not flags & _ENTRY_REPARSE:
+                    descend.append(name)    # 链接/联接只列不跟
+            else:
+                filenames.append(name)
+        yield cur, dirnames, filenames
+        for name in reversed(descend):
+            stack.append(cur / name)
+
+
 # ── 文件系统 ────────────────────────────────────────────────────────────
 
 def unique_path(dest: Path) -> Path:
@@ -442,31 +659,73 @@ def replace_robust(src: Path, dst: Path, attempts: int = 3, delay: float = 0.2) 
     raise RuntimeError(f"目标文件被占用, 替换失败: {dst.name} ({last})")
 
 
-def _rmtree_onerror(func, target, exc) -> None:
-    """rmtree 失败回调(onexc/onerror 通用): 清只读属性后重试一次。"""
-    try:
-        os.chmod(target, stat.S_IWRITE)
-    except OSError:
-        pass
-    try:
-        func(target)
-    except OSError:
-        pass
+def _unlink_link(path: Path, is_dir: bool) -> None:
+    """删掉链接/联接本身, 不碰它指向的目标。
+
+    目录联接必须用 rmdir(RemoveDirectoryW 只摘链接), 用 unlink 会失败;
+    文件链接用 unlink。
+    """
+    if is_dir:
+        try:
+            os.rmdir(path)
+            return
+        except OSError:
+            pass
+    if not unlink_robust(path, attempts=2, delay=0.1):
+        raise OSError(errno.EACCES, "链接无法删除", os.fspath(path))
+
+
+def _remove_tree(path: Path) -> None:
+    """递归删除目录树: 枚举走大缓冲, 不跟随链接, 只读文件清属性后重试。
+
+    shutil.rmtree 内部用 os.scandir(小缓冲), 在"分片响应签名校验失败"的共享
+    目录上一条都列不出来, 临时目录于是永远留在共享上; 这里换成 _iter_entries。
+    两个安全点: 用显式栈而不是递归(深目录不撞 RecursionError); 遇到链接/联接
+    只摘链接本身 —— shutil.rmtree 会把联接当目录跟进去, 把目标目录删空。
+    """
+    if _is_link_or_junction(path):
+        _unlink_link(path, path.is_dir())
+        return
+    stack = [(path, False)]
+    while stack:
+        cur, visited = stack.pop()
+        if visited:
+            try:
+                os.rmdir(cur)
+            except PermissionError:
+                os.chmod(cur, stat.S_IWRITE)
+                os.rmdir(cur)
+            continue
+        stack.append((cur, True))
+        for name, flags in _list_entries(cur):
+            if name in (".", ".."):     # 防御: 删到目录自身或父目录是灾难
+                continue
+            child = cur / name
+            if flags & _ENTRY_REPARSE:
+                if flags & _ENTRY_DIR:
+                    _unlink_link(child, True)
+                elif not unlink_robust(child, attempts=2, delay=0.1):
+                    raise OSError(errno.EACCES, "链接无法删除", os.fspath(child))
+            elif flags & _ENTRY_DIR:
+                stack.append((child, False))
+            elif not unlink_robust(child, attempts=2, delay=0.1):
+                raise OSError(errno.EACCES, "文件无法删除", os.fspath(child))
 
 
 def rmtree_robust(path: Path, attempts: int = 3, delay: float = 0.2) -> None:
     """删除目录树, 对只读属性和瞬时占用(缩略图/索引/杀软)重试。
 
-    ignore_errors=True 会让被占用的临时目录静默留下; 目标目录内的临时目录
-    不会被下次扫描清到, 所以这里多试几次。仍失败也不抛: 残留只占空间。
+    枚举用 _iter_entries(大缓冲), 不走 os.scandir: 网络共享上的大目录在小缓冲
+    枚举下会报"无效签名", shutil.rmtree 会静默留下整个临时目录。
+    仍失败也不抛: 残留只占空间。
     """
     for _ in range(attempts):
         if not os.path.lexists(path):
             return
-        if sys.version_info >= (3, 12):
-            shutil.rmtree(path, onexc=_rmtree_onerror)
-        else:
-            shutil.rmtree(path, onerror=_rmtree_onerror)
+        try:
+            _remove_tree(path)
+        except OSError:
+            pass
         if not os.path.lexists(path):
             return
         time.sleep(delay)
@@ -905,12 +1164,14 @@ def _iter_files_strict(root: Path, attempts: int = 3, delay: float = 1.0):
     网络共享(SMB)抖一下、报一句 "无效签名", 解压出来明明有几百张图, 却会
     被判成"包内没有静态图片"而保留压缩包, 且删不掉临时目录。宁可重试后报错,
     也不能把读取失败伪装成空目录。
+
+    枚举本身走 _walk_tree(大缓冲), 才能读得动 SMB 上几百条以上的大目录。
     """
     last = None
     for i in range(attempts):
         try:
             files = []
-            for dirpath, _dirnames, filenames in os.walk(
+            for dirpath, _dirnames, filenames in _walk_tree(
                     root, onerror=_raise_walk_error):
                 for name in filenames:
                     files.append(Path(dirpath) / name)
@@ -1021,7 +1282,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
         try:
             images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
         except OSError as e:
-            return "error", (f"无法读取解压目录(网络共享可能不稳定), 压缩包已保留: "
+            return "error", (f"无法读取解压目录{_smb_signature_note(e)}, 压缩包已保留: "
                              f"{_short_error(str(e), 120)}")
         stats["junk"] += junk_removed
         junk_total = junk_removed
@@ -1046,7 +1307,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
             try:
                 images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
             except OSError as e:
-                return "error", (f"无法读取解压目录(网络共享可能不稳定), 压缩包已保留: "
+                return "error", (f"无法读取解压目录{_smb_signature_note(e)}, 压缩包已保留: "
                                  f"{_short_error(str(e), 120)}")
             stats["junk"] += junk_removed
             junk_total += junk_removed
@@ -1141,9 +1402,10 @@ def _drop_stale_temp(path: Path, max_age: float = 24 * 3600) -> None:
 def collect_files(source_root: Path, target_root: Path):
     """递归收集待处理的图片、压缩包与系统垃圾文件。
 
-    用 os.walk 而不是 rglob: 必须在进入目录前剪掉链接/联接, rglob 做不到
+    用 _walk_tree 而不是 rglob: 必须在进入目录前剪掉链接/联接, rglob 做不到
     (实测 junction 会被反复跟进, 路径层层变长)。同时跳过目标目录(若在源目录内)
-    和本脚本的临时目录, 顺手清掉过期的临时目录。
+    和本脚本的临时目录, 顺手清掉过期的临时目录。枚举走大缓冲, 网络共享上的
+    大目录才读得动(见"目录枚举"一节)。
     """
     images, archives, junk = [], [], []
     target_abs = os.path.normcase(os.path.abspath(target_root))
@@ -1153,22 +1415,19 @@ def collect_files(source_root: Path, target_root: Path):
     def _on_walk_error(err: OSError) -> None:
         walk_errors.append(err)
 
-    for dirpath, dirnames, filenames in os.walk(
-            source_root, topdown=True, onerror=_on_walk_error):
-        keep = []
-        for name in dirnames:
-            full = os.path.join(dirpath, name)
-            if name.startswith(STAGING_PREFIX):
-                _drop_stale_temp(Path(full))
-                continue
-            if _is_link_or_junction(Path(full)):
-                skipped_links.append(full)
-                continue
-            if os.path.normcase(os.path.abspath(full)) == target_abs:
-                continue
-            keep.append(name)
-        dirnames[:] = keep
+    def _skip_dir(dirpath, name, flags) -> bool:
+        """True: 不进入这个子目录(临时目录顺手清理, 链接/联接剪枝)。"""
+        full = os.path.join(dirpath, name)
+        if name.startswith(STAGING_PREFIX):
+            _drop_stale_temp(Path(full))
+            return True
+        if flags & _ENTRY_REPARSE:      # 符号链接 / 目录联接: 不跟进
+            skipped_links.append(full)
+            return True
+        return os.path.normcase(os.path.abspath(full)) == target_abs
 
+    for dirpath, _dirnames, filenames in _walk_tree(
+            source_root, prune=_skip_dir, onerror=_on_walk_error):
         for name in filenames:
             p = Path(dirpath) / name
             if _is_link_or_junction(p):
