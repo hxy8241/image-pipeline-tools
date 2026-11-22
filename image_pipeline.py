@@ -794,21 +794,23 @@ def probe_image(path: Path, validate: bool = True):
             w, h = im.size
             cost = decode_cost(w, h, im.mode)
             avail = available_bytes()
-            # 解码内存必然吃紧: 先别碰像素, 连 EXIF 也不读
-            # (PNG 的 getexif() 内部会 load() 整图, 大图会先被换页拖几十秒)
+            # 解码内存必然吃紧: 先别碰像素(不 load()), 但 EXIF 只是读文件头里
+            # 的一小段, 必须读: vips 缩放时 auto_rotate=True 会真把图转正,
+            # 这里若返回未换算的宽高, --verify 会把正确的产物误判成尺寸不符。
             starved = bool(avail) and cost > avail * _MEMORY_HEADROOM
+            orientation = 1
+            try:
+                orientation = im.getexif().get(274, 1)
+            except Exception:
+                # 畸形 EXIF 可能抛出任意类型(TypeError/KeyError 等);
+                # 方向只是显示细节, 读不到就按默认方向处理, 不该判成破损
+                orientation = 1
+            if orientation in (5, 6, 7, 8):
+                w, h = h, w
             if validate and starved:
                 return ("unvalidated", w, h,
                         f"解码约需 {_gb(cost):.1f} GB, 可用 {_gb(avail):.1f} GB, "
                         f"跳过解码校验")
-            orientation = 1
-            if not starved:
-                try:
-                    orientation = im.getexif().get(274, 1)
-                except Exception:
-                    # 畸形 EXIF 可能抛出任意类型(TypeError/KeyError 等);
-                    # 方向只是显示细节, 读不到就按默认方向处理, 不该判成破损
-                    orientation = 1
             if validate and frames <= 1:
                 try:
                     im.load()
@@ -831,8 +833,6 @@ def probe_image(path: Path, validate: bool = True):
         if isinstance(e, OSError) and getattr(e, "errno", None) == 12:
             return "unvalidated", 0, 0, "操作系统内存不足, 跳过解码校验"
         return "broken", 0, 0, f"{type(e).__name__}: {e}"
-    if orientation in (5, 6, 7, 8):
-        w, h = h, w
     return ("animated" if frames > 1 else "static"), w, h, ""
 
 
@@ -1263,6 +1263,16 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
     broken_target = target_root / BROKEN_DIR_NAME / rel_parent / label
 
     tmp = make_temp_dir(archive_path.parent)
+    # 失败回滚必须连计数一起回退: emit_image 已经先累加了 stats, 而回滚会删掉
+    # 对应产物, 不回退就会在汇总里报"转 JXL 1 张"却找不到那张图。
+    stats_before = dict(stats)
+    created = []        # 本次为这个包产出的文件, 失败时回滚, 保证重跑不产生 _1 副本
+
+    def _rollback() -> None:
+        _discard_created(created)
+        stats.clear()
+        stats.update(stats_before)
+
     try:
         # -aou: 包内条目在 Windows 上撞名时自动改名而不是静默覆盖。
         # 例如 dup.jpg / DUP.JPG(大小写不敏感)、a:b.jpg / a?b.jpg(非法字符都被换成 _),
@@ -1282,6 +1292,7 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
         try:
             images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
         except OSError as e:
+            _rollback()
             return "error", (f"无法读取解压目录{_smb_signature_note(e)}, 压缩包已保留: "
                              f"{_short_error(str(e), 120)}")
         stats["junk"] += junk_removed
@@ -1301,12 +1312,14 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                     ["7z", "x", str(p), f"-o{p.parent}", "-y", "-aou"],
                     timeout=_timeout_for(p, base=_7Z_BASE_TIMEOUT, sec_per_mb=2.0))
                 if proc.returncode != 0:
+                    _rollback()
                     return "error", (f"展开内层压缩包 {p.name} 失败: "
                                      f"{_short_error(_decode_7z(proc.stderr))}")
                 p.unlink()
             try:
                 images, others, broken, unvalidated, junk_removed = classify_extracted(tmp)
             except OSError as e:
+                _rollback()
                 return "error", (f"无法读取解压目录{_smb_signature_note(e)}, 压缩包已保留: "
                                  f"{_short_error(str(e), 120)}")
             stats["junk"] += junk_removed
@@ -1314,10 +1327,11 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
         stats["unvalidated"] += unvalidated
 
         if not images and not broken:
+            # 压缩包保留, 包里的东西并没有真正清理到目标目录, 计数一并回退
+            _rollback()
             return "no_image", "包内没有静态图片(可能全是动图), 已保留压缩包"
 
         failures = []
-        created = []        # 本次为这个包产出的文件, 失败时回滚, 保证重跑不产生 _1 副本
 
         for path, rel, w, h in images:
             try:
@@ -1349,14 +1363,14 @@ def process_archive(archive_path: Path, source_root: Path, target_root: Path,
                 print(f"    失败: {name} ({err})", file=sys.stderr)
             if len(failures) > 5:
                 print(f"    ... 另有 {len(failures) - 5} 个失败未显示", file=sys.stderr)
-            _discard_created(created)
+            _rollback()
             return "error", (f"{len(failures)} 个文件处理失败, 压缩包已保留"
                              f"(本次产出已回滚, 修好后重跑不会产生重复文件)")
 
         try:
             archive_path.unlink()
         except OSError as e:
-            _discard_created(created)
+            _rollback()
             return "error", (f"文件已全部处理, 但压缩包删除失败, 本次产出已回滚"
                              f"(避免重跑产生重复): {e}")
 
@@ -1399,50 +1413,69 @@ def _drop_stale_temp(path: Path, max_age: float = 24 * 3600) -> None:
         pass
 
 
-def collect_files(source_root: Path, target_root: Path):
+def collect_files(source_root: Path, target_root: Path, attempts: int = 3,
+                  delay: float = 1.0):
     """递归收集待处理的图片、压缩包与系统垃圾文件。
 
     用 _walk_tree 而不是 rglob: 必须在进入目录前剪掉链接/联接, rglob 做不到
     (实测 junction 会被反复跟进, 路径层层变长)。同时跳过目标目录(若在源目录内)
     和本脚本的临时目录, 顺手清掉过期的临时目录。枚举走大缓冲, 网络共享上的
     大目录才读得动(见"目录枚举"一节)。
+
+    整轮扫描失败会重试(与 classify_extracted 同样 3 次); 仍读不到的目录放进
+    第四个返回值 walk_errors, 由 main 明确报错并以非 0 退出 —— 不能把"读不到"
+    表现成"源目录已经空了"。
     """
-    images, archives, junk = [], [], []
     target_abs = os.path.normcase(os.path.abspath(target_root))
-    skipped_links = []
-    walk_errors = []
 
-    def _on_walk_error(err: OSError) -> None:
-        walk_errors.append(err)
+    def _scan_once():
+        images, archives, junk = [], [], []
+        skipped_links = []
+        walk_errors = []
 
-    def _skip_dir(dirpath, name, flags) -> bool:
-        """True: 不进入这个子目录(临时目录顺手清理, 链接/联接剪枝)。"""
-        full = os.path.join(dirpath, name)
-        if name.startswith(STAGING_PREFIX):
-            _drop_stale_temp(Path(full))
-            return True
-        if flags & _ENTRY_REPARSE:      # 符号链接 / 目录联接: 不跟进
-            skipped_links.append(full)
-            return True
-        return os.path.normcase(os.path.abspath(full)) == target_abs
+        def _on_walk_error(err: OSError) -> None:
+            walk_errors.append(err)
 
-    for dirpath, _dirnames, filenames in _walk_tree(
-            source_root, prune=_skip_dir, onerror=_on_walk_error):
-        for name in filenames:
-            p = Path(dirpath) / name
-            if _is_link_or_junction(p):
-                skipped_links.append(str(p))
-                continue
-            if is_system_junk(p, source_root):
-                junk.append(p)          # 系统垃圾: 稍后确认后删除
-                continue
-            ext = file_ext(p)
-            if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
-                continue
-            if ext in ARCHIVE_EXTS:
-                archives.append(p)
-            else:
-                images.append(p)
+        def _skip_dir(dirpath, name, flags) -> bool:
+            """True: 不进入这个子目录(临时目录顺手清理, 链接/联接剪枝)。"""
+            full = os.path.join(dirpath, name)
+            if name.startswith(STAGING_PREFIX):
+                _drop_stale_temp(Path(full))
+                return True
+            if flags & _ENTRY_REPARSE:  # 符号链接 / 目录联接: 不跟进
+                skipped_links.append(full)
+                return True
+            return os.path.normcase(os.path.abspath(full)) == target_abs
+
+        for dirpath, _dirnames, filenames in _walk_tree(
+                source_root, prune=_skip_dir, onerror=_on_walk_error):
+            for name in filenames:
+                p = Path(dirpath) / name
+                if _is_link_or_junction(p):
+                    skipped_links.append(str(p))
+                    continue
+                if is_system_junk(p, source_root):
+                    junk.append(p)      # 系统垃圾: 稍后确认后删除
+                    continue
+                ext = file_ext(p)
+                if ext not in ARCHIVE_EXTS and ext not in IMAGE_EXTS:
+                    continue
+                if ext in ARCHIVE_EXTS:
+                    archives.append(p)
+                else:
+                    images.append(p)
+        return images, archives, junk, skipped_links, walk_errors
+
+    result = None
+    for i in range(attempts):
+        result = _scan_once()
+        if not result[4]:
+            break
+        if i + 1 < attempts:
+            print(f"警告: {len(result[4])} 个目录读取失败, "
+                  f"重试扫描({i + 2}/{attempts})...", file=sys.stderr)
+            time.sleep(delay * (i + 1))
+    images, archives, junk, skipped_links, walk_errors = result
 
     if skipped_links:
         print(f"提示: 跳过 {len(skipped_links)} 个链接/联接(不处理其内容):",
@@ -1454,8 +1487,8 @@ def collect_files(source_root: Path, target_root: Path):
 
     if walk_errors:
         # 读不到就明说: 否则会表现成"待处理 0 个", 像是源目录已经空了
-        print(f"警告: {len(walk_errors)} 个目录读取失败(网络共享可能不稳定), "
-              f"其中的文件本次未处理:", file=sys.stderr)
+        print(f"错误: {len(walk_errors)} 个目录在 {attempts} 次扫描后仍读取失败, "
+              f"其中的文件本次无法处理:", file=sys.stderr)
         for e in walk_errors[:5]:
             print(f"  · {e}", file=sys.stderr)
         if len(walk_errors) > 5:
@@ -1463,7 +1496,7 @@ def collect_files(source_root: Path, target_root: Path):
 
     images.sort()
     archives.sort(key=lambda p: (len(p.relative_to(source_root).parts), str(p)))
-    return images, archives, junk
+    return images, archives, junk, walk_errors
 
 
 def _cleanup_junk_files(paths, source_root: Path) -> int:
@@ -1535,7 +1568,7 @@ def main(argv=None) -> int:
     # atexit 兜住"还没走到 finally 就 return/抛异常"的路径。
     prevent_sleep()
     atexit.register(restore_sleep)
-    images, archives, junk = collect_files(source_root, dest_root)
+    images, archives, junk, walk_errors = collect_files(source_root, dest_root)
 
     # 系统垃圾(__MACOSX/、._ 前缀、.DS_Store/Thumbs.db/desktop.ini)不是图片, 清掉。
     # 删之前先探一次: 万一真有能解码的图叫这个名字, 按普通图片处理, 不误删。
@@ -1550,6 +1583,11 @@ def main(argv=None) -> int:
     images.sort()
 
     if not images and not archives:
+        if walk_errors:
+            # 扫描失败不等于目录为空: 不清理、不改动, 用非 0 退出让调用方看得见
+            print("错误: 源目录扫描失败, 无法确认是否有待处理文件, 未做任何修改。",
+                  file=sys.stderr)
+            return 3
         if junk_files and not args.dry_run:
             removed = _cleanup_junk_files(junk_files, source_root)
             print(f"源目录下没有图片或压缩包; 已清理系统垃圾 {removed} 个。")
@@ -1695,6 +1733,14 @@ def main(argv=None) -> int:
         if len(errors) > 20:
             print(f"  ... 另有 {len(errors) - 20} 个", file=sys.stderr)
 
+    if walk_errors:
+        print(f"\n错误: {len(walk_errors)} 个目录读取失败, 其中的文件未处理:",
+              file=sys.stderr)
+        for e in walk_errors[:20]:
+            print(f"  · {e}", file=sys.stderr)
+        if len(walk_errors) > 20:
+            print(f"  ... 另有 {len(walk_errors) - 20} 个", file=sys.stderr)
+        return 3
     total_errors = stats["error"] + len(errors)
     return 1 if total_errors else 0
 
